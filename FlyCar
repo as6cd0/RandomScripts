@@ -1,6 +1,8 @@
 --Fly car Script:
 	local FlyCarGui = Instance.new("ScreenGui")
 	local W = Instance.new("TextButton")
+    local Do = Instance.new("TextButton")
+    local Up = Instance.new("TextButton")
 	local S = Instance.new("TextButton")
 	local A = Instance.new("TextButton")
 	local D = Instance.new("TextButton")
@@ -23,7 +25,7 @@ FlyCarGui.Parent = game.CoreGui
     Speed.Position = UDim2.new(0.121668837, 0, 0.703604283, 0)
     Speed.Size = UDim2.new(0, 78, 0, 34)
     Speed.Font = Enum.Font.SourceSans
-    Speed.Text = "Speed"
+    Speed.Text = "35"
     Speed.TextColor3 = Color3.fromRGB(170, 0, 255)
     Speed.TextScaled = true
     Speed.TextSize = 14.000
@@ -61,6 +63,8 @@ FlyCarGui.Parent = game.CoreGui
      Open.Visible = false
      Close.Visible = true
      Speed.Visible = true
+     Do.Visible = true
+     Up.Visible = true
      unfly.Visible = true
      StopFly.Visible = true
      Fly.Visible = true
@@ -82,7 +86,9 @@ end)
      Close.MouseButton1Down:Connect(function()
      Open.Visible = true
      Close.Visible = false
+     Up.Visible = false
      Speed.Visible = false
+     Do.Visible = false
      unfly.Visible = false
      StopFly.Visible = false
      Fly.Visible = false
@@ -154,6 +160,43 @@ end)
 		BV.Velocity = game.Workspace.CurrentCamera.CFrame.LookVector * Speed.Text
 	end)
 
+Up.Name = "Up"
+Up.Parent = FlyCarGui
+Up.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+Up.Position = UDim2.new(0.100000000, 0, 0.663604283, 0)
+Up.Size = UDim2.new(0, 38, 0, 30) -- ✅ تصحيح `UP.Size` إلى `Up.Size`
+Up.Font = Enum.Font.SourceSans
+Up.Text = "+"
+Up.TextColor3 = Color3.fromRGB(226, 226, 226)
+Up.TextScaled = true
+Up.TextSize = 14.000
+Up.TextWrapped = true -- ✅ تصحيح `UP.TextWrapped` إلى `Up.TextWrapped`
+
+Up.MouseButton1Click:Connect(function()
+    local currentSpeed = tonumber(Speed.Text) -- تحويل النص إلى رقم
+    if currentSpeed then
+        Speed.Text = tostring(currentSpeed + 2) -- زيادة السرعة بمقدار 2
+    end
+end)
+
+Do.Name = "Do"
+Do.Parent = FlyCarGui
+Do.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+Do.Position = UDim2.new(0.100000000, 0, 0.745294104, 0)
+Do.Size = UDim2.new(0, 38, 0, 30) -- ✅ تصحيح `UP.Size` إلى `Up.Size`
+Do.Font = Enum.Font.SourceSans
+Do.Text = "-"
+Do.TextColor3 = Color3.fromRGB(226, 226, 226)
+Do.TextScaled = true
+Do.TextSize = 14.000
+Do.TextWrapped = true -- ✅ تصحيح `UP.TextWrapped` إلى `Up.TextWrapped`
+
+Do.MouseButton1Click:Connect(function()
+    local currentSpeed = tonumber(Speed.Text) -- تحويل النص إلى رقم
+    if currentSpeed then
+        Speed.Text = tostring(currentSpeed - 2) -- زيادة السرعة بمقدار 2
+    end
+end)
 
 	S.Name = "S"
 	S.Parent = FlyCarGui
