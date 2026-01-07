@@ -4,424 +4,788 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
 
 local Player = Players.LocalPlayer
-local Character
-local Humanoid
-local RootPart
+local Character, Humanoid, RootPart
 
-local PERCEPTION_THROTTLE = 0.1
-local EMERGENCY_DISTANCE = 16
-local EMERGENCY_SPEED = 90
-local ENGAGE_DISTANCE = 35
-local OBSERVE_DISTANCE = 25
-local PARRY_DISTANCE = 5
-local LEAD_DISTANCE = 2
-local PATH_RECOMPUTE_DELAY = 1.5
-local SIDESTEP_DISTANCE = 5
-local ROAM_RADIUS = 15
+local DEFAULT_PARAMS = {
+    perceptionThrottle = 0.08,
+    emergencyDistance = 16,
+    emergencySpeed = 90,
+    engageDistance = 35,
+    observeDistance = 25,
+    parryDistance = 5,
+    leadDistance = 2,
+    pathRecomputeDelay = 1.2,
+    sidestepDistance = 5,
+    roamRadius = 15,
+    historyBufferSize = 5,
+    maxParryAttempts = 3,
+    parryStyle = "balanced",
+    safeMode = false,
+    enableParry = true,
+    enableEngage = true,
+    enableEmergency = true,
+    enableRoam = true,
+    enableVirtualInput = false,
+    facePlayerProbability = 0.6,
+    personalSpaceMin = 8,
+    personalSpaceMax = 15,
+    threatDecayRate = 0.1,
+    actionCooldown = 0.15,
+    pingEstimate = 50,
+    maxConcurrentTasks = 8,
+    debugMode = false
+}
+
+local params = {}
+for k, v in pairs(DEFAULT_PARAMS) do params[k] = v end
 
 local State = {
     IDLE = "Idle",
     OBSERVE = "Observe",
     ENGAGE = "Engage",
-    EMERGENCY = "Emergency"
+    EMERGENCY = "Emergency",
+    ROAM = "Roam",
+    RETREAT = "Retreat",
+    STANCE = "Stance"
 }
 
-local currentState = State.IDLE
 local running = false
-local mainConnection
+local currentState = State.IDLE
+local debugEnabled = false
+local lastPrintTime = {}
+
+local connections = {}
+local activeTasks = {}
+local taskCount = 0
+
+local threatCache = {}
+local threatHistory = {}
+local threatDecay = {}
+local ballCooldowns = {}
+local playerMemory = {}
+local telemetry = {
+    parryAttempts = {},
+    parrySuccess = 0,
+    parryFails = 0,
+    emergencyTriggers = 0,
+    pathSuccesses = 0,
+    pathFailures = 0,
+    avgReactionTime = 0,
+    sessionStart = 0,
+    rttSamples = {}
+}
+
 local perceptionTimer = 0
 local lastPathTime = 0
-local currentPath
-local currentWaypointIndex
-local targetPosition
-local targetFacing
-local debugEnabled = false
-local threatDecay = {}
+local lastActionTime = 0
+local actionLock = false
+local actionUntil = 0
+local currentPath = nil
+local currentWaypointIndex = 1
+local moveConnection = nil
+local parryHelper = nil
+local lastPingMeasure = 0
+local holdPosition = false
+local pauseUntil = 0
+local manualOverride = false
+local lastPlayerPos = nil
+
+local stateCallbacks = {}
+local parryCallbacks = {}
+
+local function debugPrint(category, msg)
+    if not debugEnabled then return end
+    local now = tick()
+    if lastPrintTime[category] and (now - lastPrintTime[category]) < 0.2 then return end
+    lastPrintTime[category] = now
+    print("[SmartAutoPlay:" .. category .. "] " .. msg)
+end
+
+local function safeCall(fn, ...)
+    local success, result = pcall(fn, ...)
+    if not success then
+        debugPrint("Error", tostring(result))
+    end
+    return success, result
+end
 
 local function getCharacterComponents()
     Character = Player.Character
     if not Character then return false end
-    
     Humanoid = Character:FindFirstChildOfClass("Humanoid")
     RootPart = Character:FindFirstChild("HumanoidRootPart")
-    
     return Humanoid and RootPart and Humanoid.Health > 0
 end
 
+local function validateVector(v)
+    if not v then return Vector3.zero end
+    local mag = v.Magnitude
+    if mag ~= mag or mag == math.huge or mag == -math.huge then
+        return Vector3.zero
+    end
+    return v
+end
+
+local function safeUnit(v)
+    local validated = validateVector(v)
+    if validated.Magnitude < 0.001 then
+        return Vector3.new(0, 0, 1)
+    end
+    return validated.Unit
+end
+
+local function clamp(value, min, max)
+    return math.min(math.max(value, min), max)
+end
+
+local function measurePing()
+    local start = tick()
+    local estimate = params.pingEstimate or 50
+    table.insert(telemetry.rttSamples, estimate)
+    if #telemetry.rttSamples > 10 then
+        table.remove(telemetry.rttSamples, 1)
+    end
+    local sum = 0
+    for _, v in ipairs(telemetry.rttSamples) do sum = sum + v end
+    return sum / #telemetry.rttSamples
+end
+
 local function isValidBall(ball)
-    if not ball or not ball:IsA("BasePart") then return false end
-    if not ball:GetAttribute("realBall") then return false end
+    if not ball or not ball:IsA("BasePart") or not ball.Parent then return false end
+    local attr = ball:GetAttribute("realBall")
+    if attr == false then return false end
     return true
 end
 
 local function getBallVelocity(ball)
     local zoomies = ball:FindFirstChild("zoomies")
     if zoomies and zoomies:IsA("BodyVelocity") then
-        return zoomies.VectorVelocity
+        return validateVector(zoomies.VectorVelocity)
     end
-    return ball.AssemblyLinearVelocity
+    return validateVector(ball.AssemblyLinearVelocity)
+end
+
+local function detectSpike(ballId, currentSpeed, currentDir)
+    local history = threatHistory[ballId]
+    if not history or #history < 2 then return false end
+    local lastSpeed = history[#history].speed
+    local lastDir = history[#history].direction
+    if currentSpeed > lastSpeed * 1.5 then return true end
+    if lastDir and currentDir then
+        local dotChange = lastDir:Dot(currentDir)
+        if dotChange < 0.7 then return true end
+    end
+    return false
+end
+
+local function updateBallHistory(ballId, pos, vel, speed)
+    if not threatHistory[ballId] then
+        threatHistory[ballId] = {}
+    end
+    local history = threatHistory[ballId]
+    table.insert(history, {
+        position = pos,
+        velocity = vel,
+        speed = speed,
+        direction = safeUnit(vel),
+        timestamp = tick()
+    })
+    while #history > params.historyBufferSize do
+        table.remove(history, 1)
+    end
+end
+
+local function checkLineOfSight(targetPos)
+    if not RootPart then return false end
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local origin = RootPart.Position + Vector3.new(0, 2, 0)
+    local direction = targetPos - origin
+    local result = Workspace:Raycast(origin, direction, rayParams)
+    if not result then return true end
+    return result.Instance:IsDescendantOf(Character) or result.Distance > direction.Magnitude * 0.9
+end
+
+local function computeInterceptPoint(ballPos, velocity, leadDist)
+    local adjusted = leadDist * (1 + params.pingEstimate / 200)
+    return ballPos - safeUnit(velocity) * adjusted
+end
+
+local function checkGroundSafety(position)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local origin = position + Vector3.new(0, 3, 0)
+    local result = Workspace:Raycast(origin, Vector3.new(0, -10, 0), rayParams)
+    return result ~= nil and result.Distance < 8
 end
 
 local function evaluateBallThreat(ball)
     if not isValidBall(ball) or not RootPart then return nil end
-    
     local ballPos = ball.Position
     local velocity = getBallVelocity(ball)
     local speed = velocity.Magnitude
-    
-    if speed <= 0 then return nil end
-    
+    if speed < 1 then return nil end
     local playerPos = RootPart.Position
     local toPlayer = playerPos - ballPos
     local distance = toPlayer.Magnitude
-    local directionDot = toPlayer.Unit:Dot(velocity.Unit)
-    
-    if directionDot <= 0.2 then return nil end
-    
-    local timeToHit = math.max(0, (distance - PARRY_DISTANCE) / speed)
-    
+    local dirUnit = safeUnit(toPlayer)
+    local velUnit = safeUnit(velocity)
+    local directionDot = dirUnit:Dot(velUnit)
+    if directionDot <= 0.15 then return nil end
+    local timeToHit = math.max(0, (distance - params.parryDistance) / speed)
+    local ballId = ball:GetDebugId()
+    updateBallHistory(ballId, ballPos, velocity, speed)
+    local spike = detectSpike(ballId, speed, velUnit)
+    local speedPenalty = speed > 100 and -0.1 or 0
+    local targetAttr = ball:GetAttribute("target")
+    local targetBoost = (targetAttr == Player.Name) and -0.3 or 0
     local decayFactor = threatDecay[ball] or 1
-    local score = timeToHit - (directionDot * 0.25) + (distance / 100)
+    local visible = checkLineOfSight(ballPos)
+    local visibilityBoost = visible and -0.05 or 0.1
+    local score = timeToHit - (directionDot * 0.25) + (distance / 100) + speedPenalty + targetBoost + visibilityBoost
     score = score * decayFactor
-    
+    if spike then score = score * 0.8 end
     return {
         ball = ball,
+        ballId = ballId,
         position = ballPos,
         velocity = velocity,
         speed = speed,
         distance = distance,
         directionDot = directionDot,
         timeToHit = timeToHit,
-        score = score
+        score = score,
+        visible = visible,
+        spike = spike
     }
 end
 
-local function findMostDangerousBall()
+local function findTopThreats(n)
     local ballsFolder = Workspace:FindFirstChild("Balls")
-    if not ballsFolder then return nil end
-    
-    local mostDangerous = nil
-    local lowestScore = math.huge
-    
+    if not ballsFolder then return {} end
+    local threats = {}
     for _, ball in pairs(ballsFolder:GetChildren()) do
-        local threat = evaluateBallThreat(ball)
-        if threat and threat.score < lowestScore then
-            lowestScore = threat.score
-            mostDangerous = threat
+        local cooldown = ballCooldowns[ball]
+        if not cooldown or (tick() - cooldown) > 0.5 then
+            local threat = evaluateBallThreat(ball)
+            if threat then
+                table.insert(threats, threat)
+            end
         end
     end
-    
-    return mostDangerous
+    table.sort(threats, function(a, b) return a.score < b.score end)
+    local topN = {}
+    for i = 1, math.min(n or 3, #threats) do
+        table.insert(topN, threats[i])
+    end
+    return topN
 end
 
 local function findNearestPlayer()
     if not RootPart then return nil end
-    
-    local nearestPlayer = nil
-    local nearestDistance = math.huge
     local aliveFolder = Workspace:FindFirstChild("Alive")
-    
     if not aliveFolder then return nil end
-    
+    local nearest = nil
+    local nearestDist = math.huge
     for _, otherChar in pairs(aliveFolder:GetChildren()) do
         if otherChar ~= Character and otherChar:FindFirstChild("HumanoidRootPart") then
             local otherHum = otherChar:FindFirstChildOfClass("Humanoid")
             if otherHum and otherHum.Health > 0 then
-                local distance = (otherChar.HumanoidRootPart.Position - RootPart.Position).Magnitude
-                if distance < nearestDistance then
-                    nearestDistance = distance
-                    nearestPlayer = {
+                local otherRoot = otherChar.HumanoidRootPart
+                local distance = (otherRoot.Position - RootPart.Position).Magnitude
+                if distance < nearestDist then
+                    nearestDist = distance
+                    local velocity = Vector3.zero
+                    local memEntry = playerMemory[otherChar]
+                    if memEntry and memEntry.lastPos then
+                        velocity = (otherRoot.Position - memEntry.lastPos) / 0.1
+                    end
+                    nearest = {
                         character = otherChar,
                         distance = distance,
-                        position = otherChar.HumanoidRootPart.Position
+                        position = otherRoot.Position,
+                        velocity = velocity,
+                        humanoid = otherHum,
+                        lastSeen = tick()
                     }
+                    if not playerMemory[otherChar] then
+                        playerMemory[otherChar] = {}
+                    end
+                    playerMemory[otherChar].lastPos = otherRoot.Position
+                    playerMemory[otherChar].lastVel = velocity
                 end
             end
         end
     end
-    
-    return nearestPlayer
+    return nearest
 end
 
-local function faceTarget(targetPos)
+local function countPlayerCluster(center, radius)
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    if not aliveFolder then return 0 end
+    local count = 0
+    for _, char in pairs(aliveFolder:GetChildren()) do
+        if char:FindFirstChild("HumanoidRootPart") then
+            local dist = (char.HumanoidRootPart.Position - center).Magnitude
+            if dist <= radius then count = count + 1 end
+        end
+    end
+    return count
+end
+
+local function faceTarget(targetPos, smooth)
     if not RootPart then return end
-    
     local rootPos = RootPart.Position
     local lookAt = Vector3.new(targetPos.X, rootPos.Y, targetPos.Z)
-    RootPart.CFrame = CFrame.new(rootPos, lookAt)
+    local targetCF = CFrame.new(rootPos, lookAt)
+    if smooth then
+        RootPart.CFrame = RootPart.CFrame:Lerp(targetCF, 0.3)
+    else
+        RootPart.CFrame = targetCF
+    end
 end
 
-local function performSidestep(directionVector)
+local function performSidestep(directionVector, distance)
     if not RootPart or not Humanoid then return end
-    
-    local sidestepPos = RootPart.Position + (directionVector * SIDESTEP_DISTANCE)
-    Humanoid:MoveTo(sidestepPos)
+    local sidestepPos = RootPart.Position + safeUnit(directionVector) * (distance or params.sidestepDistance)
+    if checkGroundSafety(sidestepPos) then
+        Humanoid:MoveTo(sidestepPos)
+    end
 end
 
 local function createPath()
-    local path = PathfindingService:CreatePath({
+    return PathfindingService:CreatePath({
         AgentRadius = 2,
         AgentHeight = 5,
         AgentCanJump = true,
         AgentMaxSlope = 45,
-        Costs = {
-            Water = 20
-        }
+        Costs = { Water = 20 }
     })
-    return path
 end
 
 local function followPath(destination)
-    if not RootPart or not Humanoid then return false end
-    
-    local success, errorMsg = pcall(function()
+    if not RootPart or not Humanoid or actionLock then return false end
+    local success = safeCall(function()
         if not currentPath then
             currentPath = createPath()
         end
-        
         currentPath:ComputeAsync(RootPart.Position, destination)
-        
-        if currentPath.Status == Enum.PathStatus.Success then
-            local waypoints = currentPath:GetWaypoints()
-            currentWaypointIndex = 1
-            
-            for i, waypoint in ipairs(waypoints) do
-                if not running or currentState ~= State.ENGAGE then break end
-                
-                if waypoint.Action == Enum.PathWaypointAction.Jump then
-                    Humanoid.Jump = true
-                end
-                
-                Humanoid:MoveTo(waypoint.Position)
-                
-                local timeout = 0
-                repeat
-                    task.wait(0.1)
-                    timeout = timeout + 0.1
-                until (RootPart.Position - waypoint.Position).Magnitude < 3 or timeout > 2 or not running
-            end
-            return true
-        else
+        if currentPath.Status ~= Enum.PathStatus.Success then
             Humanoid:MoveTo(destination)
+            telemetry.pathFailures = telemetry.pathFailures + 1
             return false
         end
-    end)
-    
-    if not success then
-        if Humanoid then
-            Humanoid:MoveTo(destination)
+        telemetry.pathSuccesses = telemetry.pathSuccesses + 1
+        local waypoints = currentPath:GetWaypoints()
+        for i, waypoint in ipairs(waypoints) do
+            if not running or actionLock or holdPosition then break end
+            local wpPos = waypoint.Position
+            if wpPos.X ~= wpPos.X then break end
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                Humanoid.Jump = true
+            end
+            Humanoid:MoveTo(wpPos)
+            local timeout = 0
+            while running and not holdPosition do
+                local dist = (RootPart.Position - wpPos).Magnitude
+                if dist < 4 then break end
+                timeout = timeout + 0.1
+                if timeout > 3 then break end
+                task.wait(0.1)
+            end
         end
-        return false
-    end
-    
+        return true
+    end)
     return success
 end
 
-local function decideState(dangerousBall, nearestPlayer)
-    if dangerousBall then
-        if dangerousBall.distance <= EMERGENCY_DISTANCE and dangerousBall.speed >= EMERGENCY_SPEED then
-            return State.EMERGENCY
-        elseif dangerousBall.timeToHit <= 0.55 and dangerousBall.distance <= ENGAGE_DISTANCE then
-            return State.ENGAGE
-        end
+local function moveToPosition(pos)
+    if not Humanoid or actionLock or holdPosition then return end
+    if checkGroundSafety(pos) then
+        Humanoid:MoveTo(pos)
     end
-    
-    if nearestPlayer and nearestPlayer.distance <= OBSERVE_DISTANCE then
-        return State.OBSERVE
+end
+
+local function attemptParry(threat)
+    if not params.enableParry or not threat or not threat.ball then return end
+    if ballCooldowns[threat.ball] and (tick() - ballCooldowns[threat.ball]) < 1 then return end
+    actionLock = true
+    actionUntil = tick() + 0.2
+    ballCooldowns[threat.ball] = tick()
+    local jitter = math.random(0, 30) / 1000
+    task.wait(jitter)
+    if not running or not threat.ball.Parent then
+        actionLock = false
+        return
     end
-    
-    return State.IDLE
+    faceTarget(threat.position, false)
+    task.wait(0.01)
+    local parryData = {
+        ballId = threat.ballId,
+        timeToHit = threat.timeToHit,
+        ping = params.pingEstimate,
+        timestamp = tick(),
+        success = false
+    }
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local parryRemote = remotes and remotes:FindFirstChild("ParryAttempt")
+    if parryRemote and not params.safeMode then
+        safeCall(function()
+            parryRemote:FireServer(0.5, CFrame.new(), {["enzo"] = Vector3.new()}, {500, 500})
+        end)
+        telemetry.parrySuccess = telemetry.parrySuccess + 1
+        parryData.success = true
+    elseif params.enableVirtualInput and not params.safeMode then
+        VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+        task.wait(0.02)
+        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        telemetry.parrySuccess = telemetry.parrySuccess + 1
+        parryData.success = true
+    else
+        telemetry.parryFails = telemetry.parryFails + 1
+    end
+    table.insert(telemetry.parryAttempts, parryData)
+    while #telemetry.parryAttempts > 50 do
+        table.remove(telemetry.parryAttempts, 1)
+    end
+    for _, callback in ipairs(parryCallbacks) do
+        safeCall(callback, parryData)
+    end
+    task.wait(0.15)
+    actionLock = false
 end
 
 local function handleEmergencyState(threat)
-    if not RootPart then return end
-    
+    if not params.enableEmergency or not RootPart then return end
+    telemetry.emergencyTriggers = telemetry.emergencyTriggers + 1
+    debugPrint("State", "EMERGENCY triggered")
     local perpendicular = Vector3.new(-threat.velocity.Z, 0, threat.velocity.X).Unit
-    
-    performSidestep(perpendicular)
-    
-    if threat.ball then
-        faceTarget(threat.ball.Position)
-    end
-    
-    threatDecay[threat.ball] = 0.5
+    if math.random() > 0.5 then perpendicular = -perpendicular end
+    performSidestep(perpendicular, params.sidestepDistance * 1.5)
+    faceTarget(threat.position, false)
+    attemptParry(threat)
+    threatDecay[threat.ball] = 0.4
 end
 
 local function handleEngageState(threat)
-    if not RootPart then return end
-    
-    local currentTime = tick()
-    
-    local interceptPoint = threat.position - (threat.velocity.Unit * LEAD_DISTANCE)
+    if not params.enableEngage or not RootPart then return end
+    local now = tick()
+    local interceptPoint = computeInterceptPoint(threat.position, threat.velocity, params.leadDistance)
     local distance = (RootPart.Position - interceptPoint).Magnitude
-    
-    if distance > 3 and (currentTime - lastPathTime) > PATH_RECOMPUTE_DELAY then
-        lastPathTime = currentTime
+    if distance > 5 and (now - lastPathTime) > params.pathRecomputeDelay then
+        lastPathTime = now
         task.spawn(function()
             followPath(interceptPoint)
         end)
-    elseif distance <= 3 then
-        Humanoid:MoveTo(RootPart.Position)
+    elseif distance <= 5 then
+        faceTarget(threat.position, true)
+        if threat.timeToHit <= 0.55 then
+            attemptParry(threat)
+        end
     end
-    
-    if threat.ball then
-        faceTarget(threat.ball.Position)
-    end
-    
-    threatDecay[threat.ball] = 1.2
+    threatDecay[threat.ball] = 1.1
 end
 
 local function handleObserveState(nearestPlayer)
     if not RootPart or not nearestPlayer then return end
-    
-    faceTarget(nearestPlayer.position)
-    
-    local idealDistance = OBSERVE_DISTANCE * 0.7
-    if nearestPlayer.distance < idealDistance then
-        local awayVector = (RootPart.Position - nearestPlayer.position).Unit
-        local retreatPos = RootPart.Position + (awayVector * 3)
-        Humanoid:MoveTo(retreatPos)
-    elseif nearestPlayer.distance > OBSERVE_DISTANCE * 0.9 then
-        Humanoid:MoveTo(RootPart.Position)
+    if math.random() < params.facePlayerProbability then
+        faceTarget(nearestPlayer.position, true)
+    end
+    local personalSpace = math.random(params.personalSpaceMin, params.personalSpaceMax)
+    if nearestPlayer.distance < personalSpace * 0.7 then
+        local awayVector = safeUnit(RootPart.Position - nearestPlayer.position)
+        local retreatPos = RootPart.Position + awayVector * 4
+        moveToPosition(retreatPos)
+    elseif nearestPlayer.distance > personalSpace * 1.3 then
+        moveToPosition(RootPart.Position)
     end
 end
 
-local function handleIdleState()
+local function handleRetreatState(threats)
+    if not RootPart then return end
+    local avgThreatPos = Vector3.zero
+    for _, threat in ipairs(threats) do
+        avgThreatPos = avgThreatPos + threat.position
+    end
+    avgThreatPos = avgThreatPos / #threats
+    local awayVector = safeUnit(RootPart.Position - avgThreatPos)
+    local retreatPos = RootPart.Position + awayVector * params.roamRadius
+    if checkGroundSafety(retreatPos) then
+        moveToPosition(retreatPos)
+    end
+end
+
+local function handleRoamState()
+    if not RootPart or not Humanoid or not params.enableRoam then return end
+    local randomAngle = math.random() * math.pi * 2
+    local randomDist = math.random() * params.roamRadius
+    local offsetX = math.cos(randomAngle) * randomDist
+    local offsetZ = math.sin(randomAngle) * randomDist
+    local roamPos = RootPart.Position + Vector3.new(offsetX, 0, offsetZ)
+    if checkGroundSafety(roamPos) then
+        moveToPosition(roamPos)
+        local waitTime = math.random(10, 30) / 10
+        task.wait(waitTime)
+    end
+end
+
+local function handleStanceState()
     if not RootPart or not Humanoid then return end
-    
-    local randomX = math.random(-ROAM_RADIUS, ROAM_RADIUS)
-    local randomZ = math.random(-ROAM_RADIUS, ROAM_RADIUS)
-    local roamPos = RootPart.Position + Vector3.new(randomX, 0, randomZ)
-    
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {Character}
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    
-    local rayOrigin = roamPos + Vector3.new(0, 5, 0)
-    local result = Workspace:Raycast(rayOrigin, Vector3.new(0, -10, 0), rayParams)
-    
-    if result then
-        roamPos = result.Position
+    Humanoid:Move(Vector3.new(0, 0, 0), true)
+    if math.random() < 0.3 then
+        local microOffset = Vector3.new(math.random(-2, 2), 0, math.random(-2, 2))
+        moveToPosition(RootPart.Position + microOffset)
     end
-    
-    Humanoid:MoveTo(roamPos)
-    
-    local timeout = 0
-    repeat
-        task.wait(0.5)
-        timeout = timeout + 0.5
-    until not running or timeout > 3
 end
 
-local function updateDebugDisplay(dangerousBall, nearestPlayer)
-    if not debugEnabled then return end
-    
-    local debugText = string.format(
-        "State: %s | Ball: %s | TTH: %.2f | Player Dist: %.1f",
-        currentState,
-        dangerousBall and "YES" or "NO",
-        dangerousBall and dangerousBall.timeToHit or 0,
-        nearestPlayer and nearestPlayer.distance or 999
-    )
-    
-    print(debugText)
+local function decideState(topThreats, nearestPlayer)
+    local primaryThreat = topThreats[1]
+    if primaryThreat then
+        if primaryThreat.distance <= params.emergencyDistance and primaryThreat.speed >= params.emergencySpeed then
+            return State.EMERGENCY, primaryThreat
+        elseif primaryThreat.timeToHit <= 0.65 and primaryThreat.distance <= params.engageDistance then
+            return State.ENGAGE, primaryThreat
+        elseif #topThreats >= 2 and topThreats[2].timeToHit <= 1.0 then
+            return State.RETREAT, topThreats
+        end
+    end
+    if nearestPlayer and nearestPlayer.distance <= params.observeDistance then
+        return State.OBSERVE, nearestPlayer
+    end
+    if math.random() < 0.15 then
+        return State.STANCE, nil
+    end
+    return State.ROAM, nil
+end
+
+local function executeState(state, data)
+    if state == State.EMERGENCY and data then
+        handleEmergencyState(data)
+    elseif state == State.ENGAGE and data then
+        handleEngageState(data)
+    elseif state == State.OBSERVE and data then
+        handleObserveState(data)
+    elseif state == State.RETREAT and data then
+        handleRetreatState(data)
+    elseif state == State.STANCE then
+        handleStanceState()
+    elseif state == State.ROAM then
+        handleRoamState()
+    end
 end
 
 local function mainLoop(deltaTime)
     if not running or not getCharacterComponents() then return end
-    
+    if pauseUntil > 0 and tick() < pauseUntil then return end
+    if actionLock and tick() < actionUntil then return end
+    actionLock = false
     perceptionTimer = perceptionTimer + deltaTime
-    
-    if perceptionTimer >= PERCEPTION_THROTTLE then
-        perceptionTimer = 0
-        
-        local dangerousBall = findMostDangerousBall()
-        local nearestPlayer = findNearestPlayer()
-        
-        local newState = decideState(dangerousBall, nearestPlayer)
-        
-        if newState ~= currentState then
-            currentState = newState
-            currentPath = nil
-            lastPathTime = 0
+    if perceptionTimer < params.perceptionThrottle then return end
+    perceptionTimer = 0
+    if tick() - lastPingMeasure > 5 then
+        lastPingMeasure = tick()
+        params.pingEstimate = measurePing()
+    end
+    if lastPlayerPos then
+        local currentPos = RootPart.Position
+        local moveDelta = (currentPos - lastPlayerPos).Magnitude
+        if moveDelta > 5 then
+            manualOverride = true
+            task.delay(2, function() manualOverride = false end)
         end
-        
-        if currentState == State.EMERGENCY and dangerousBall then
-            handleEmergencyState(dangerousBall)
-        elseif currentState == State.ENGAGE and dangerousBall then
-            handleEngageState(dangerousBall)
-        elseif currentState == State.OBSERVE and nearestPlayer then
-            handleObserveState(nearestPlayer)
-        elseif currentState == State.IDLE then
-            handleIdleState()
+    end
+    lastPlayerPos = RootPart.Position
+    if manualOverride then return end
+    local topThreats = findTopThreats(3)
+    local nearestPlayer = findNearestPlayer()
+    local newState, stateData = decideState(topThreats, nearestPlayer)
+    if newState ~= currentState then
+        local oldState = currentState
+        currentState = newState
+        debugPrint("State", "Transition: " .. oldState .. " -> " .. newState)
+        for _, callback in ipairs(stateCallbacks) do
+            safeCall(callback, newState, oldState)
         end
-        
-        updateDebugDisplay(dangerousBall, nearestPlayer)
-        
-        for ball, decay in pairs(threatDecay) do
-            if not ball or not ball.Parent then
-                threatDecay[ball] = nil
-            else
-                threatDecay[ball] = math.min(1, decay + 0.1)
-            end
+        currentPath = nil
+        lastPathTime = 0
+    end
+    executeState(currentState, stateData)
+    for ball, decay in pairs(threatDecay) do
+        if not ball or not ball.Parent then
+            threatDecay[ball] = nil
+        else
+            threatDecay[ball] = math.min(1.2, decay + params.threatDecayRate)
+        end
+    end
+    for ball, cooldownTime in pairs(ballCooldowns) do
+        if not ball or not ball.Parent or (tick() - cooldownTime) > 3 then
+            ballCooldowns[ball] = nil
         end
     end
 end
 
 function SmartAutoPlay.Start()
     if running then return end
-    
     running = true
     currentState = State.IDLE
-    perceptionTimer = 0
-    threatDecay = {}
-    
+    telemetry.sessionStart = tick()
+    debugPrint("Lifecycle", "SmartAutoPlay started")
     if not getCharacterComponents() then
         Player.CharacterAdded:Wait()
         getCharacterComponents()
     end
-    
-    mainConnection = RunService.Heartbeat:Connect(mainLoop)
-    
-    Player.CharacterAdded:Connect(function(newChar)
-        if running then
-            task.wait(0.5)
-            getCharacterComponents()
-        end
+    connections.heartbeat = RunService.Heartbeat:Connect(function(dt)
+        safeCall(mainLoop, dt)
     end)
+    connections.charAdded = Player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        getCharacterComponents()
+        threatCache = {}
+        threatHistory = {}
+        actionLock = false
+        currentPath = nil
+    end)
+    local success, helper = safeCall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/TripleScript/TripleHub/main/helper_.lua"))()
+    end)
+    if success and helper then
+        parryHelper = helper
+        debugPrint("Init", "Parry helper loaded")
+    end
 end
 
 function SmartAutoPlay.Stop()
+    if not running then return end
     running = false
     currentState = State.IDLE
-    
-    if mainConnection then
-        mainConnection:Disconnect()
-        mainConnection = nil
+    debugPrint("Lifecycle", "SmartAutoPlay stopped")
+    for name, conn in pairs(connections) do
+        if conn then conn:Disconnect() end
     end
-    
-    currentPath = nil
-    currentWaypointIndex = nil
+    connections = {}
+    for _, task in pairs(activeTasks) do
+        if task then task:Cancel() end
+    end
+    activeTasks = {}
+    if moveConnection then
+        moveConnection:Disconnect()
+        moveConnection = nil
+    end
+    threatCache = {}
+    threatHistory = {}
     threatDecay = {}
-    
+    ballCooldowns = {}
+    currentPath = nil
+    actionLock = false
     if Humanoid then
         Humanoid:Move(Vector3.new(0, 0, 0), true)
     end
 end
 
-function SmartAutoPlay.SetDebug(enabled)
-    debugEnabled = enabled
+function SmartAutoPlay.IsRunning()
+    return running
 end
 
-function SmartAutoPlay.SetParameters(params)
-    EMERGENCY_DISTANCE = params.emergencyDistance or EMERGENCY_DISTANCE
-    EMERGENCY_SPEED = params.emergencySpeed or EMERGENCY_SPEED
-    ENGAGE_DISTANCE = params.engageDistance or ENGAGE_DISTANCE
-    OBSERVE_DISTANCE = params.observeDistance or OBSERVE_DISTANCE
-    PARRY_DISTANCE = params.parryDistance or PARRY_DISTANCE
-    LEAD_DISTANCE = params.leadDistance or LEAD_DISTANCE
+function SmartAutoPlay.SetDebug(enabled)
+    debugEnabled = enabled
+    debugPrint("Config", "Debug mode: " .. tostring(enabled))
+end
+
+function SmartAutoPlay.SetParameters(newParams)
+    for k, v in pairs(newParams) do
+        if params[k] ~= nil then
+            if type(v) == "number" then
+                params[k] = clamp(v, 0, 1000)
+            else
+                params[k] = v
+            end
+        end
+    end
+    debugPrint("Config", "Parameters updated")
+end
+
+function SmartAutoPlay.GetTelemetry()
+    local runtime = tick() - telemetry.sessionStart
+    return {
+        runtime = runtime,
+        parryAttempts = #telemetry.parryAttempts,
+        parrySuccess = telemetry.parrySuccess,
+        parryFails = telemetry.parryFails,
+        successRate = telemetry.parrySuccess / math.max(1, telemetry.parrySuccess + telemetry.parryFails),
+        emergencyTriggers = telemetry.emergencyTriggers,
+        pathSuccesses = telemetry.pathSuccesses,
+        pathFailures = telemetry.pathFailures,
+        avgPing = params.pingEstimate,
+        currentState = currentState,
+        recentAttempts = telemetry.parryAttempts
+    }
+end
+
+function SmartAutoPlay.GetTopThreats(n)
+    return findTopThreats(n or 3)
+end
+
+function SmartAutoPlay.OnStateChanged(callback)
+    table.insert(stateCallbacks, callback)
+end
+
+function SmartAutoPlay.OnParryAttempt(callback)
+    table.insert(parryCallbacks, callback)
+end
+
+function SmartAutoPlay.PauseFor(seconds)
+    pauseUntil = tick() + seconds
+end
+
+function SmartAutoPlay.SetHoldPosition(enabled)
+    holdPosition = enabled
+end
+
+function SmartAutoPlay.ResetState()
+    threatCache = {}
+    threatHistory = {}
+    threatDecay = {}
+    ballCooldowns = {}
+    actionLock = false
+    currentPath = nil
+    debugPrint("State", "State reset")
+end
+
+function SmartAutoPlay.LoadProfile(profileName)
+    local profiles = {
+        conservative = {
+            emergencyDistance = 20,
+            emergencySpeed = 70,
+            parryStyle = "conservative",
+            leadDistance = 3,
+            engageDistance = 30
+        },
+        balanced = {
+            emergencyDistance = 16,
+            emergencySpeed = 90,
+            parryStyle = "balanced",
+            leadDistance = 2,
+            engageDistance = 35
+        },
+        aggressive = {
+            emergencyDistance = 12,
+            emergencySpeed = 110,
+            parryStyle = "aggressive",
+            leadDistance = 1.5,
+            engageDistance = 45
+        }
+    }
+    local profile = profiles[profileName]
+    if profile then
+        SmartAutoPlay.SetParameters(profile)
+        debugPrint("Config", "Loaded profile: " .. profileName)
+    end
 end
 
 return SmartAutoPlay
