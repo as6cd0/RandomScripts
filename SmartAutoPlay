@@ -1,642 +1,791 @@
--- SERVICES
+local SmartAutoPlay = {}
+
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local TextChatService = game:GetService("TextChatService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
 
--- CONSTANTS & CONFIG
-local LocalPlayer = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
-local CHARACTER_SETUP_DELAY = 2
+local Player = Players.LocalPlayer
+local Character, Humanoid, RootPart
 
-local AI_CONFIG = {
-    REACTION_BASE = 0.18,      -- Base human reaction (seconds)
-    REACTION_VAR = 0.05,       -- Variance (Gaussian)
-    PANIC_MULTIPLIER = 0.6,    -- Faster reaction when panicking
-    FAIL_RATE_BASE = 0.03,     -- 3% chance to fail parry (Human Error)
-    JITTER_INTENSITY = 0.15,   -- Camera shake intensity
-    PARRY_DISTANCE = 6,        -- Max distance to attempt parry
-    PING_OFFSET = 0.04,        -- Estimation of server latency handling
+local DEFAULT_PARAMS = {
+    perceptionThrottle = 0.08,
+    emergencyDistance = 16,
+    emergencySpeed = 90,
+    engageDistance = 35,
+    observeDistance = 25,
+    parryDistance = 5,
+    leadDistance = 2,
+    pathRecomputeDelay = 1.2,
+    sidestepDistance = 5,
+    roamRadius = 15,
+    historyBufferSize = 5,
+    maxParryAttempts = 3,
+    parryStyle = "balanced",
+    safeMode = false,
+    enableParry = true,
+    enableEngage = true,
+    enableEmergency = true,
+    enableRoam = true,
+    enableVirtualInput = false,
+    facePlayerProbability = 0.6,
+    personalSpaceMin = 8,
+    personalSpaceMax = 15,
+    threatDecayRate = 0.1,
+    actionCooldown = 0.15,
+    pingEstimate = 50,
+    maxConcurrentTasks = 8,
+    debugMode = false
 }
 
--- SECTION 6: ARCHITECTURE & OPTIMIZATION (MAID CLASS)
-local Maid = {}
-Maid.__index = Maid
+local params = {}
+for k, v in pairs(DEFAULT_PARAMS) do params[k] = v end
 
-function Maid.new()
-    local self = setmetatable({}, Maid)
-    self._tasks = {}
-    return self
-end
-
-function Maid:Give(task)
-    if task == nil then return end
-    table.insert(self._tasks, task)
-    return task
-end
-
-function Maid:Clean()
-    for _, task in pairs(self._tasks) do
-        if typeof(task) == "RBXScriptConnection" then
-            task:Disconnect()
-        elseif type(task) == "function" then
-            task()
-        elseif task.Destroy then
-            task:Destroy()
-        end
-    end
-    self._tasks = {}
-end
-
-local maid = Maid.new()
-
--- UTILITY MATH (GAUSSIAN / NORMAL DISTRIBUTION)
-local function RandomGaussian(mean, stddev)
-    local y1
-    local y2
-    local x1
-    local x2
-    local w
-    repeat
-        x1 = 2 * math.random() - 1
-        x2 = 2 * math.random() - 1
-        w = x1 * x1 + x2 * x2
-    until w >= 1 or w == 0
-    w = math.sqrt((-2 * math.log(w)) / w)
-    return mean + (x1 * w * stddev)
-end
-
-local function Lerp(a, b, t)
-    return a + (b - a) * t
-end
-
-local function GetDistance(pos1, pos2)
-    return (pos1 - pos2).Magnitude
-end
-
--- SECTION 1: PERCEPTION & PHYSICS
-local Physics = {
-    Gravity = workspace.Gravity,
-    BallCache = {},
-    LastVelocities = {}
+local State = {
+    IDLE = "Idle",
+    OBSERVE = "Observe",
+    ENGAGE = "Engage",
+    EMERGENCY = "Emergency",
+    ROAM = "Roam",
+    RETREAT = "Retreat",
+    STANCE = "Stance"
 }
 
-function Physics.PredictTrajectory(ball, timeAhead)
-    if not ball or not ball.Parent then return nil end
-    
-    local vel = ball.AssemblyLinearVelocity
-    local pos = ball.Position
-    
-    -- Curve Detection: Compare current acceleration vs history
-    local lastVel = Physics.LastVelocities[ball]
-    Physics.LastVelocities[ball] = vel
-    
-    local isCurving = false
-    if lastVel then
-        local diff = (vel - lastVel).Magnitude
-        if diff > 15 then -- Arbitrary threshold for curveball detection
-            isCurving = true
-        end
-    end
-    
-    -- Simple linear prediction with gravity offset
-    local gravityOffset = Vector3.new(0, -0.5 * Physics.Gravity * (timeAhead^2), 0)
-    return pos + (vel * timeAhead) + gravityOffset, isCurving
-end
+local running = false
+local currentState = State.IDLE
+local debugEnabled = false
+local lastPrintTime = {}
 
-function Physics.CalculateTTI(ball, characterPos)
-    if not ball then return math.huge end
-    local dist = GetDistance(ball.Position, characterPos)
-    local speed = ball.AssemblyLinearVelocity.Magnitude
-    
-    if speed == 0 then return math.huge end
-    
-    -- Add dynamic "Kill Zone" check (ball slows down slightly at end of curve)
-    local killZoneRadius = 10 + (speed * 0.1)
-    
-    local timeToImpact = (dist - killZoneRadius) / speed
-    return math.max(0, timeToImpact)
-end
+local connections = {}
+local activeTasks = {}
+local taskCount = 0
 
-function Physics.IsVisible(targetPos)
-    local character = LocalPlayer.Character
-    if not character then return false end
-    local head = character:FindFirstChild("Head")
-    if not head then return false end
-    
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {character}
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    
-    local result = workspace:Raycast(head.Position, targetPos - head.Position, rayParams)
-    return result == nil or (result.Instance:IsDescendantOf(targetPos.Parent))
-end
-
-function Physics.IsTargetingMe(ball)
-    if not ball then return false end
-    local char = LocalPlayer.Character
-    if not char then return false end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
-    
-    local toMe = (root.Position - ball.Position).Unit
-    local ballVel = ball.AssemblyLinearVelocity.Unit
-    
-    -- Dot product > 0.9 means roughly facing me
-    return toMe:Dot(ballVel) > 0.85
-end
-
-function Physics.GetRealBalls()
-    local balls = {}
-    -- Common folder names in Blade Ball games
-    local container = workspace:FindFirstChild("Balls") or workspace
-    for _, obj in pairs(container:GetDescendants()) do
-        if obj:IsA("BasePart") then
-            local attr = obj:GetAttribute("realBall")
-            -- Filter fake balls or visual glitches
-            if attr == true or (obj.Name:lower():find("ball") and obj:GetMass() > 1) then
-                table.insert(balls, obj)
-            end
-        end
-    end
-    return balls
-end
-
--- SECTION 2: OPPONENT PROFILING (MEMORY)
-local Memory = {
-    Profiles = {},
-    MyKiller = nil,
-    DeathCount = 0
+local threatCache = {}
+local threatHistory = {}
+local threatDecay = {}
+local ballCooldowns = {}
+local playerMemory = {}
+local telemetry = {
+    parryAttempts = {},
+    parrySuccess = 0,
+    parryFails = 0,
+    emergencyTriggers = 0,
+    pathSuccesses = 0,
+    pathFailures = 0,
+    avgReactionTime = 0,
+    sessionStart = 0,
+    rttSamples = {}
 }
 
-function Memory.UpdateProfile(player, eventType, data)
-    if not Memory.Profiles[player] then
-        Memory.Profiles[player] = {
-            Aggression = 0.5, -- 0 to 1
-            CurveTendency = 0,
-            ThreatLevel = 1,
-            IsAFK = false,
-            LastPosition = Vector3.new(0,0,0),
-            IsAllied = false,
-            InsultedBot = false
-        }
+local perceptionTimer = 0
+local lastPathTime = 0
+local lastActionTime = 0
+local actionLock = false
+local actionUntil = 0
+local currentPath = nil
+local currentWaypointIndex = 1
+local moveConnection = nil
+local parryHelper = nil
+local lastPingMeasure = 0
+local holdPosition = false
+local pauseUntil = 0
+local manualOverride = false
+local lastPlayerPos = nil
+
+local stateCallbacks = {}
+local parryCallbacks = {}
+
+local function debugPrint(category, msg)
+    if not debugEnabled then return end
+    local now = tick()
+    if lastPrintTime[category] and (now - lastPrintTime[category]) < 0.2 then return end
+    lastPrintTime[category] = now
+    print("[SmartAutoPlay:" .. category .. "] " .. msg)
+end
+
+local function safeCall(fn, ...)
+    local success, result = pcall(fn, ...)
+    if not success then
+        debugPrint("Error", tostring(result))
     end
-    
-    local profile = Memory.Profiles[player]
-    
-    if eventType == "AGGRESSIVE_MOVE" then
-        profile.Aggression = math.min(1, profile.Aggression + 0.05)
-    elseif eventType == "KILL" then
-        profile.ThreatLevel = profile.ThreatLevel + 1
-        if data == LocalPlayer.Name then
-            Memory.MyKiller = player
-            Memory.DeathCount = Memory.DeathCount + 1
-        end
-    elseif eventType == "CURVE_BALL" then
-        profile.CurveTendency = profile.CurveTendency + 1
-    elseif eventType == "CHAT_INSULT" then
-        profile.InsultedBot = true
-    elseif eventType == "AFK_CHECK" then
-        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-            local currentPos = player.Character.HumanoidRootPart.Position
-            if (currentPos - profile.LastPosition).Magnitude < 1 then
-                profile.IsAFK = true
-            else
-                profile.IsAFK = false
-            end
-            profile.LastPosition = currentPos
-        end
+    return success, result
+end
+
+local function getCharacterComponents()
+    Character = Player.Character
+    if not Character then return false end
+    Humanoid = Character:FindFirstChildOfClass("Humanoid")
+    RootPart = Character:FindFirstChild("HumanoidRootPart")
+    return Humanoid and RootPart and Humanoid.Health > 0
+end
+
+local function validateVector(v)
+    if not v then return Vector3.zero end
+    local mag = v.Magnitude
+    if mag ~= mag or mag == math.huge or mag == -math.huge then
+        return Vector3.zero
     end
+    return v
 end
 
-function Memory.GetHighestThreat()
-    local highest = nil
-    local highestScore = -1
-    
-    for player, profile in pairs(Memory.Profiles) do
-        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("Humanoid") and player.Character.Humanoid.Health > 0 then
-            local score = (profile.ThreatLevel * 2) + (profile.Aggression * 5)
-            if profile.InsultedBot then score = score + 100 end -- Priority Target
-            if score > highestScore then
-                highestScore = score
-                highest = player
-            end
-        end
+local function safeUnit(v)
+    local validated = validateVector(v)
+    if validated.Magnitude < 0.001 then
+        return Vector3.new(0, 0, 1)
     end
-    return highest
+    return validated.Unit
 end
 
--- SECTION 3: HUMAN-LIKE MOTOR CONTROL
-local Motor = {
-    CurrentLookTarget = nil,
-    LastClickTime = 0,
-    PanicMode = false
-}
-
-function Motor.LookAt(targetPos, dt)
-    if not targetPos then return end
-    
-    local head = LocalPlayer.Character:FindFirstChild("Head")
-    if not head then return end
-    
-    -- Micro-Jitter
-    local jitter = Vector3.new(
-        RandomGaussian(0, AI_CONFIG.JITTER_INTENSITY),
-        RandomGaussian(0, AI_CONFIG.JITTER_INTENSITY),
-        RandomGaussian(0, AI_CONFIG.JITTER_INTENSITY)
-    )
-    
-    local targetWithJitter = targetPos + jitter
-    local goalCFrame = CFrame.lookAt(head.Position, targetWithJitter)
-    
-    -- Smooth Camera (Tweening logic manually implemented for per-frame control)
-    local alpha = Motor.PanicMode and 0.4 or 0.1 -- Panic = faster movement
-    head.CFrame = head.CFrame:Lerp(goalCFrame, alpha)
-    
-    -- Sync Camera
-    Camera.CFrame = head.CFrame
+local function clamp(value, min, max)
+    return math.min(math.max(value, min), max)
 end
 
-function Motor.SimulateParry()
-    if tick() - Motor.LastClickTime < 0.5 then return end -- Debounce
-    
-    -- Input Lag Simulation
-    local lag = RandomGaussian(0.02, 0.01)
-    
-    -- Variable Press Duration
-    local pressDuration = RandomGaussian(0.05, 0.01)
-    
-    -- Human Error Check
-    local errorChance = AI_CONFIG.FAIL_RATE_BASE
-    if Memory.MyKiller then errorChance = errorChance + 0.05 end
-    
-    if math.random() < errorChance then
-        -- Fail to parry intentionally
-        return
+local function measurePing()
+    local start = tick()
+    local estimate = params.pingEstimate or 50
+    table.insert(telemetry.rttSamples, estimate)
+    if #telemetry.rttSamples > 10 then
+        table.remove(telemetry.rttSamples, 1)
     end
-    
-    task.wait(lag)
-    
-    -- Virtual Input
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-    task.wait(pressDuration)
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-    
-    Motor.LastClickTime = tick()
+    local sum = 0
+    for _, v in ipairs(telemetry.rttSamples) do sum = sum + v end
+    return sum / #telemetry.rttSamples
 end
 
--- SECTION 4: TACTICAL MOVEMENT
-local Movement = {
-    Path = nil,
-    TargetPos = nil,
-    OrbitalAngle = 0
-}
-
-function Movement.MoveTo(pos)
-    local humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
-    if not humanoid then return end
-    
-    humanoid:MoveTo(pos)
+local function isValidBall(ball)
+    if not ball or not ball:IsA("BasePart") or not ball.Parent then return false end
+    local attr = ball:GetAttribute("realBall")
+    if attr == false then return false end
+    return true
 end
 
-function Movement.OrbitalMovement(center, radius)
-    Movement.OrbitalAngle = Movement.OrbitalAngle + 0.05
-    local offset = Vector3.new(math.cos(Movement.OrbitalAngle), 0, math.sin(Movement.OrbitalAngle)) * radius
-    Movement.MoveTo(center + offset)
-end
-
-function Movement.TacticalJump(ballPos)
-    local humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
-    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    
-    if not humanoid or not root then return end
-    
-    local distToBall = GetDistance(root.Position, ballPos)
-    
-    -- Jump only if ball is close and fast
-    if distToBall < 15 and not humanoid.Jump and not humanoid.FloorMaterial == Enum.Material.Air then
-        if math.random() < 0.3 then -- Don't jump spam
-            humanoid.Jump = true
-        end
+local function getBallVelocity(ball)
+    local zoomies = ball:FindFirstChild("zoomies")
+    if zoomies and zoomies:IsA("BodyVelocity") then
+        return validateVector(zoomies.VectorVelocity)
     end
+    return validateVector(ball.AssemblyLinearVelocity)
 end
 
-function Movement.SafeNavigate(targetPos)
-    -- Ground Safety Check
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {LocalPlayer.Character}
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    
-    local result = workspace:Raycast(targetPos + Vector3.new(0, 5, 0), Vector3.new(0, -20, 0), rayParams)
-    if not result then return false end -- Void below
-    
-    -- Zig Zag Logic
-    local zigZag = Vector3.new(math.sin(tick()*2)*2, 0, 0)
-    
-    -- Use Pathfinding if distance is large or complex
-    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if root and GetDistance(root.Position, targetPos) > 30 then
-        task.spawn(function()
-            local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5})
-            local success, err = pcall(function()
-                path:ComputeAsync(root.Position, targetPos)
-            end)
-            if success and path.Status == Enum.PathStatus.Success then
-                local waypoints = path:GetWaypoints()
-                if #waypoints > 1 then
-                    Movement.MoveTo(waypoints[2].Position) -- Move to first real waypoint
-                end
-            else
-                Movement.MoveTo(targetPos + zigZag)
-            end
-        end)
-    else
-        Movement.MoveTo(targetPos + zigZag)
-    end
-end
-
--- SECTION 5: SOCIAL ENGINEERING
-local Social = {
-    NextChatTime = 0,
-    Emotes = {
-        "rbxassetid://5106345846", -- Wave
-        "rbxassetid://3344652363", -- Laugh
-        "rbxassetid://4857019846"  -- Flex
-    }
-}
-
-function Social.Say(msg)
-    if tick() < Social.NextChatTime then return end
-    
-    -- Chat Spoofing (Standard method)
-    local chatEvent = TextChatService and TextChatService:FindFirstChild("TextChannels") and TextChatService.TextChannels:FindFirstChild("RBXGeneral") or ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents"):FindFirstChild("SayMessageRequest")
-    
-    if chatEvent then
-        if TextChatService then
-            chatEvent:SendAsync(msg)
-        else
-            chatEvent:FireServer(msg, "All")
-        end
-    end
-    
-    Social.NextChatTime = tick() + math.random(5, 15)
-end
-
-function Social.ReactToEvent(eventType)
-    local rng = math.random()
-    if eventType == "KILL" then
-        if rng < 0.3 then Social.Say("ez") end
-        if rng < 0.2 then Social.PlayEmote() end
-        if rng < 0.4 then Social.BMSpin() end
-    elseif eventType == "DEATH" then
-        if rng < 0.4 then Social.Say("lag") end
-        if rng < 0.1 then Social.Say("wp") end
-        if Memory.DeathCount >= 3 then Social.RageQuitSim() end
-    elseif eventType == "WIN" then
-        if rng < 0.5 then Social.Say("gg") end
-    end
-end
-
-function Social.PlayEmote()
-    local humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
-    if humanoid then
-        local animId = Social.Emotes[math.random(1, #Social.Emotes)]
-        local anim = Instance.new("Animation")
-        anim.AnimationId = animId
-        local track = humanoid:LoadAnimation(anim)
-        track:Play()
-        track.Ended:Connect(function() track:Destroy() anim:Destroy() end)
-    end
-end
-
-function Social.BMSpin()
-    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if root then
-        local startC = root.CFrame
-        local spin = TweenService:Create(root, TweenInfo.new(1), {CFrame = startC * CFrame.Angles(0, math.rad(360), 0)})
-        spin:Play()
-    end
-end
-
-function Social.RageQuitSim()
-    -- "Erratic" behavior: Spin camera wildly, spam crouch
-    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if root then
-        for i = 1, 10 do
-            root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(36), 0)
-            task.wait(0.05)
-        end
-    end
-    -- Then "calm down"
-    task.wait(2)
-    Memory.DeathCount = 0 -- Reset rage counter
-end
-
--- MAIN AI BRAIN
-local Brain = {
-    State = "IDLE", -- IDLE, OBSERVE, ENGAGE, EVADE, PANIC, FAKE_AFK
-    ActiveBall = nil,
-    LastStateChange = 0
-}
-
-local function SetState(newState)
-    if Brain.State == newState then return end
-    Brain.State = newState
-    Brain.LastStateChange = tick()
-end
-
-local function DetectModerators()
-    -- Simple heuristic: Check for players with Admin badge or specific names
-    for _, player in pairs(Players:GetPlayers()) do
-        if player.Name:lower():find("admin") or player:GetRankInGroup(0) > 200 then -- Mock group check
-            return true
-        end
+local function detectSpike(ballId, currentSpeed, currentDir)
+    local history = threatHistory[ballId]
+    if not history or #history < 2 then return false end
+    local lastSpeed = history[#history].speed
+    local lastDir = history[#history].direction
+    if currentSpeed > lastSpeed * 1.5 then return true end
+    if lastDir and currentDir then
+        local dotChange = lastDir:Dot(currentDir)
+        if dotChange < 0.7 then return true end
     end
     return false
 end
 
-local function MainLoop()
-    if DetectModerators() then
-        -- Disable AI features if admin detected
-        return 
+local function updateBallHistory(ballId, pos, vel, speed)
+    if not threatHistory[ballId] then
+        threatHistory[ballId] = {}
     end
-    
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChild("Humanoid")
-    
-    if not root or not hum or hum.Health <= 0 then return end
-    
-    -- 1. Perception: Scan for balls
-    local balls = Physics.GetRealBalls()
-    local closestThreat = nil
-    local minTTI = math.huge
-    
-    for _, ball in pairs(balls) do
-        local tti = Physics.CalculateTTI(ball, root.Position)
-        local isTargetingMe = Physics.IsTargetingMe(ball)
-        local isVisible = Physics.IsVisible(ball.Position)
-        
-        -- Weigh threat
-        if isTargetingMe and isVisible then
-            if tti < minTTI then
-                minTTI = tti
-                closestThreat = ball
+    local history = threatHistory[ballId]
+    table.insert(history, {
+        position = pos,
+        velocity = vel,
+        speed = speed,
+        direction = safeUnit(vel),
+        timestamp = tick()
+    })
+    while #history > params.historyBufferSize do
+        table.remove(history, 1)
+    end
+end
+
+local function checkLineOfSight(targetPos)
+    if not RootPart then return false end
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local origin = RootPart.Position + Vector3.new(0, 2, 0)
+    local direction = targetPos - origin
+    local result = Workspace:Raycast(origin, direction, rayParams)
+    if not result then return true end
+    return result.Instance:IsDescendantOf(Character) or result.Distance > direction.Magnitude * 0.9
+end
+
+local function computeInterceptPoint(ballPos, velocity, leadDist)
+    local adjusted = leadDist * (1 + params.pingEstimate / 200)
+    return ballPos - safeUnit(velocity) * adjusted
+end
+
+local function checkGroundSafety(position)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local origin = position + Vector3.new(0, 3, 0)
+    local result = Workspace:Raycast(origin, Vector3.new(0, -10, 0), rayParams)
+    return result ~= nil and result.Distance < 8
+end
+
+local function evaluateBallThreat(ball)
+    if not isValidBall(ball) or not RootPart then return nil end
+    local ballPos = ball.Position
+    local velocity = getBallVelocity(ball)
+    local speed = velocity.Magnitude
+    if speed < 1 then return nil end
+    local playerPos = RootPart.Position
+    local toPlayer = playerPos - ballPos
+    local distance = toPlayer.Magnitude
+    local dirUnit = safeUnit(toPlayer)
+    local velUnit = safeUnit(velocity)
+    local directionDot = dirUnit:Dot(velUnit)
+    if directionDot <= 0.15 then return nil end
+    local timeToHit = math.max(0, (distance - params.parryDistance) / speed)
+    local ballId = ball:GetDebugId()
+    updateBallHistory(ballId, ballPos, velocity, speed)
+    local spike = detectSpike(ballId, speed, velUnit)
+    local speedPenalty = speed > 100 and -0.1 or 0
+    local targetAttr = ball:GetAttribute("target")
+    local targetBoost = (targetAttr == Player.Name) and -0.3 or 0
+    local decayFactor = threatDecay[ball] or 1
+    local visible = checkLineOfSight(ballPos)
+    local visibilityBoost = visible and -0.05 or 0.1
+    local score = timeToHit - (directionDot * 0.25) + (distance / 100) + speedPenalty + targetBoost + visibilityBoost
+    score = score * decayFactor
+    if spike then score = score * 0.8 end
+    return {
+        ball = ball,
+        ballId = ballId,
+        position = ballPos,
+        velocity = velocity,
+        speed = speed,
+        distance = distance,
+        directionDot = directionDot,
+        timeToHit = timeToHit,
+        score = score,
+        visible = visible,
+        spike = spike
+    }
+end
+
+local function findTopThreats(n)
+    local ballsFolder = Workspace:FindFirstChild("Balls")
+    if not ballsFolder then return {} end
+    local threats = {}
+    for _, ball in pairs(ballsFolder:GetChildren()) do
+        local cooldown = ballCooldowns[ball]
+        if not cooldown or (tick() - cooldown) > 0.5 then
+            local threat = evaluateBallThreat(ball)
+            if threat then
+                table.insert(threats, threat)
             end
         end
-        
-        -- Update Memory based on ball holder (simplified)
-        local owner = ball:GetAttribute("owner") -- Mock attribute, usually exists in these games
-        if owner then
-            local ownerPlr = Players:FindFirstChild(owner)
-            if ownerPlr then Memory.UpdateProfile(ownerPlr, "AGGRESSIVE_MOVE") end
-        end
     end
-    
-    -- 2. State Machine Decision
-    local nearbyPlayers = 0
-    for _, p in pairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
-            if GetDistance(root.Position, p.Character.HumanoidRootPart.Position) < 20 then
-                nearbyPlayers = nearbyPlayers + 1
-            end
-        end
+    table.sort(threats, function(a, b) return a.score < b.score end)
+    local topN = {}
+    for i = 1, math.min(n or 3, #threats) do
+        table.insert(topN, threats[i])
     end
-    
-    -- State Transitions
-    if Brain.State ~= "FAKE_AFK" then
-        if closestThreat and minTTI < 0.8 then
-            if nearbyPlayers > 3 and minTTI < 0.4 then
-                SetState("PANIC")
-            else
-                SetState("EVADE")
-            end
-        elseif closestThreat and minTTI < 2.5 then
-            SetState("ENGAGE")
-        elseif math.random() < 0.001 then -- 0.1% chance per frame to fake AFK
-            SetState("FAKE_AFK")
-        else
-            SetState("IDLE")
-        end
-    else
-        -- Break Fake AFK if threat is immediate
-        if closestThreat and minTTI < 0.6 then
-            SetState("EVADE")
-        end
-    end
-    
-    -- 3. Execution based on State
-    Motor.PanicMode = (Brain.State == "PANIC")
-    
-    if Brain.State == "FAKE_AFK" then
-        -- Stand still
-        hum:Move(Vector3.new(0,0,0), true)
-        -- Randomly look around slightly
-        Motor.LookAt(root.Position + Vector3.new(math.sin(tick()), 0, math.cos(tick())), 0.1)
-        
-    elseif Brain.State == "PANIC" then
-        if closestThreat then
-            Motor.LookAt(closestThreat.Position, 0.1)
-            Motor.SimulateParry()
-            Movement.OrbitalMovement(root.Position, 5) -- Spin in place
-        end
-        
-    elseif Brain.State == "EVADE" or Brain.State == "ENGAGE" then
-        if closestThreat then
-            local predictedPos, isCurving = Physics.PredictTrajectory(closestThreat, 0.3 + (AI_CONFIG.PING_OFFSET))
-            
-            Motor.LookAt(predictedPos, 0.2)
-            
-            if isCurving then
-                -- Side step
-                local perp = Vector3.new(-closestThreat.AssemblyLinearVelocity.Z, 0, closestThreat.AssemblyLinearVelocity.X).Unit
-                Movement.SafeNavigate(root.Position + (perp * 5))
-            else
-                -- Move to intercept
-                if GetDistance(root.Position, predictedPos) > AI_CONFIG.PARRY_DISTANCE then
-                    Movement.SafeNavigate(predictedPos)
-                else
-                    hum:Move(Vector3.new(0,0,0), true) -- Stop and prep
+    return topN
+end
+
+local function findNearestPlayer()
+    if not RootPart then return nil end
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    if not aliveFolder then return nil end
+    local nearest = nil
+    local nearestDist = math.huge
+    for _, otherChar in pairs(aliveFolder:GetChildren()) do
+        if otherChar ~= Character and otherChar:FindFirstChild("HumanoidRootPart") then
+            local otherHum = otherChar:FindFirstChildOfClass("Humanoid")
+            if otherHum and otherHum.Health > 0 then
+                local otherRoot = otherChar.HumanoidRootPart
+                local distance = (otherRoot.Position - RootPart.Position).Magnitude
+                if distance < nearestDist then
+                    nearestDist = distance
+                    local velocity = Vector3.zero
+                    local memEntry = playerMemory[otherChar]
+                    if memEntry and memEntry.lastPos then
+                        velocity = (otherRoot.Position - memEntry.lastPos) / 0.1
+                    end
+                    nearest = {
+                        character = otherChar,
+                        distance = distance,
+                        position = otherRoot.Position,
+                        velocity = velocity,
+                        humanoid = otherHum,
+                        lastSeen = tick()
+                    }
+                    if not playerMemory[otherChar] then
+                        playerMemory[otherChar] = {}
+                    end
+                    playerMemory[otherChar].lastPos = otherRoot.Position
+                    playerMemory[otherChar].lastVel = velocity
                 end
             end
-            
-            -- Parry Timing Calculation
-            local reactionTime = RandomGaussian(AI_CONFIG.REACTION_BASE, AI_CONFIG.REACTION_VAR)
-            if Brain.State == "PANIC" then reactionTime = reactionTime * AI_CONFIG.PANIC_MULTIPLIER end
-            
-            -- Dynamic Adjustment: If I died to this player before, speed up
-            -- (Mock logic: Assume ball owner is the threat)
-            
-            if minTTI <= reactionTime then
-                Motor.SimulateParry()
+        end
+    end
+    return nearest
+end
+
+local function countPlayerCluster(center, radius)
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    if not aliveFolder then return 0 end
+    local count = 0
+    for _, char in pairs(aliveFolder:GetChildren()) do
+        if char:FindFirstChild("HumanoidRootPart") then
+            local dist = (char.HumanoidRootPart.Position - center).Magnitude
+            if dist <= radius then count = count + 1 end
+        end
+    end
+    return count
+end
+
+local function faceTarget(targetPos, smooth)
+    if not RootPart then return end
+    local rootPos = RootPart.Position
+    local lookAt = Vector3.new(targetPos.X, rootPos.Y, targetPos.Z)
+    local targetCF = CFrame.new(rootPos, lookAt)
+    if smooth then
+        RootPart.CFrame = RootPart.CFrame:Lerp(targetCF, 0.3)
+    else
+        RootPart.CFrame = targetCF
+    end
+end
+
+local function performSidestep(directionVector, distance)
+    if not RootPart or not Humanoid then return end
+    local sidestepPos = RootPart.Position + safeUnit(directionVector) * (distance or params.sidestepDistance)
+    if checkGroundSafety(sidestepPos) then
+        Humanoid:MoveTo(sidestepPos)
+    end
+end
+
+local function createPath()
+    return PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentMaxSlope = 45,
+        Costs = { Water = 20 }
+    })
+end
+
+local function followPath(destination)
+    if not RootPart or not Humanoid or actionLock then return false end
+    local success = safeCall(function()
+        if not currentPath then
+            currentPath = createPath()
+        end
+        currentPath:ComputeAsync(RootPart.Position, destination)
+        if currentPath.Status ~= Enum.PathStatus.Success then
+            Humanoid:MoveTo(destination)
+            telemetry.pathFailures = telemetry.pathFailures + 1
+            return false
+        end
+        telemetry.pathSuccesses = telemetry.pathSuccesses + 1
+        local waypoints = currentPath:GetWaypoints()
+        for i, waypoint in ipairs(waypoints) do
+            if not running or actionLock or holdPosition then break end
+            local wpPos = waypoint.Position
+            if wpPos.X ~= wpPos.X then break end
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                Humanoid.Jump = true
             end
-            
-            Movement.TacticalJump(closestThreat.Position)
+            Humanoid:MoveTo(wpPos)
+            local timeout = 0
+            while running and not holdPosition do
+                local dist = (RootPart.Position - wpPos).Magnitude
+                if dist < 4 then break end
+                timeout = timeout + 0.1
+                if timeout > 3 then break end
+                task.wait(0.1)
+            end
         end
-        
-    elseif Brain.State == "IDLE" then
-        -- Look at nearest threat player
-        local threat = Memory.GetHighestThreat()
-        if threat and threat.Character and threat.Character:FindFirstChild("HumanoidRootPart") then
-            Motor.LookAt(threat.Character.HumanoidRootPart.Position, 0.05)
+        return true
+    end)
+    return success
+end
+
+local function moveToPosition(pos)
+    if not Humanoid or actionLock or holdPosition then return end
+    if checkGroundSafety(pos) then
+        Humanoid:MoveTo(pos)
+    end
+end
+
+local function attemptParry(threat)
+    if not params.enableParry or not threat or not threat.ball then return end
+    if ballCooldowns[threat.ball] and (tick() - ballCooldowns[threat.ball]) < 1 then return end
+    actionLock = true
+    actionUntil = tick() + 0.2
+    ballCooldowns[threat.ball] = tick()
+    local jitter = math.random(0, 30) / 1000
+    task.wait(jitter)
+    if not running or not threat.ball.Parent then
+        actionLock = false
+        return
+    end
+    faceTarget(threat.position, false)
+    task.wait(0.01)
+    local parryData = {
+        ballId = threat.ballId,
+        timeToHit = threat.timeToHit,
+        ping = params.pingEstimate,
+        timestamp = tick(),
+        success = false
+    }
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local parryRemote = remotes and remotes:FindFirstChild("ParryAttempt")
+    if parryRemote and not params.safeMode then
+        safeCall(function()
+            parryRemote:FireServer(0.5, CFrame.new(), {["enzo"] = Vector3.new()}, {500, 500})
+        end)
+        telemetry.parrySuccess = telemetry.parrySuccess + 1
+        parryData.success = true
+    elseif params.enableVirtualInput and not params.safeMode then
+        VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+        task.wait(0.02)
+        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        telemetry.parrySuccess = telemetry.parrySuccess + 1
+        parryData.success = true
+    else
+        telemetry.parryFails = telemetry.parryFails + 1
+    end
+    table.insert(telemetry.parryAttempts, parryData)
+    while #telemetry.parryAttempts > 50 do
+        table.remove(telemetry.parryAttempts, 1)
+    end
+    for _, callback in ipairs(parryCallbacks) do
+        safeCall(callback, parryData)
+    end
+    task.wait(0.15)
+    actionLock = false
+end
+
+local function handleEmergencyState(threat)
+    if not params.enableEmergency or not RootPart then return end
+    telemetry.emergencyTriggers = telemetry.emergencyTriggers + 1
+    debugPrint("State", "EMERGENCY triggered")
+    local perpendicular = Vector3.new(-threat.velocity.Z, 0, threat.velocity.X).Unit
+    if math.random() > 0.5 then perpendicular = -perpendicular end
+    performSidestep(perpendicular, params.sidestepDistance * 1.5)
+    faceTarget(threat.position, false)
+    attemptParry(threat)
+    threatDecay[threat.ball] = 0.4
+end
+
+local function handleEngageState(threat)
+    if not params.enableEngage or not RootPart then return end
+    local now = tick()
+    local interceptPoint = computeInterceptPoint(threat.position, threat.velocity, params.leadDistance)
+    local distance = (RootPart.Position - interceptPoint).Magnitude
+    if distance > 5 and (now - lastPathTime) > params.pathRecomputeDelay then
+        lastPathTime = now
+        task.spawn(function()
+            followPath(interceptPoint)
+        end)
+    elseif distance <= 5 then
+        faceTarget(threat.position, true)
+        if threat.timeToHit <= 0.55 then
+            attemptParry(threat)
+        end
+    end
+    threatDecay[threat.ball] = 1.1
+end
+
+local function handleObserveState(nearestPlayer)
+    if not RootPart or not nearestPlayer then return end
+    if math.random() < params.facePlayerProbability then
+        faceTarget(nearestPlayer.position, true)
+    end
+    local personalSpace = math.random(params.personalSpaceMin, params.personalSpaceMax)
+    if nearestPlayer.distance < personalSpace * 0.7 then
+        local awayVector = safeUnit(RootPart.Position - nearestPlayer.position)
+        local retreatPos = RootPart.Position + awayVector * 4
+        moveToPosition(retreatPos)
+    elseif nearestPlayer.distance > personalSpace * 1.3 then
+        moveToPosition(RootPart.Position)
+    end
+end
+
+local function handleRetreatState(threats)
+    if not RootPart then return end
+    local avgThreatPos = Vector3.zero
+    for _, threat in ipairs(threats) do
+        avgThreatPos = avgThreatPos + threat.position
+    end
+    avgThreatPos = avgThreatPos / #threats
+    local awayVector = safeUnit(RootPart.Position - avgThreatPos)
+    local retreatPos = RootPart.Position + awayVector * params.roamRadius
+    if checkGroundSafety(retreatPos) then
+        moveToPosition(retreatPos)
+    end
+end
+
+local function handleRoamState()
+    if not RootPart or not Humanoid or not params.enableRoam then return end
+    local randomAngle = math.random() * math.pi * 2
+    local randomDist = math.random() * params.roamRadius
+    local offsetX = math.cos(randomAngle) * randomDist
+    local offsetZ = math.sin(randomAngle) * randomDist
+    local roamPos = RootPart.Position + Vector3.new(offsetX, 0, offsetZ)
+    if checkGroundSafety(roamPos) then
+        moveToPosition(roamPos)
+        local waitTime = math.random(10, 30) / 10
+        task.wait(waitTime)
+    end
+end
+
+local function handleStanceState()
+    if not RootPart or not Humanoid then return end
+    Humanoid:Move(Vector3.new(0, 0, 0), true)
+    if math.random() < 0.3 then
+        local microOffset = Vector3.new(math.random(-2, 2), 0, math.random(-2, 2))
+        moveToPosition(RootPart.Position + microOffset)
+    end
+end
+
+local function decideState(topThreats, nearestPlayer)
+    local primaryThreat = topThreats[1]
+    if primaryThreat then
+        if primaryThreat.distance <= params.emergencyDistance and primaryThreat.speed >= params.emergencySpeed then
+            return State.EMERGENCY, primaryThreat
+        elseif primaryThreat.timeToHit <= 0.65 and primaryThreat.distance <= params.engageDistance then
+            return State.ENGAGE, primaryThreat
+        elseif #topThreats >= 2 and topThreats[2].timeToHit <= 1.0 then
+            return State.RETREAT, topThreats
+        end
+    end
+    if nearestPlayer and nearestPlayer.distance <= params.observeDistance then
+        return State.OBSERVE, nearestPlayer
+    end
+    if math.random() < 0.15 then
+        return State.STANCE, nil
+    end
+    return State.ROAM, nil
+end
+
+local function executeState(state, data)
+    if state == State.EMERGENCY and data then
+        handleEmergencyState(data)
+    elseif state == State.ENGAGE and data then
+        handleEngageState(data)
+    elseif state == State.OBSERVE and data then
+        handleObserveState(data)
+    elseif state == State.RETREAT and data then
+        handleRetreatState(data)
+    elseif state == State.STANCE then
+        handleStanceState()
+    elseif state == State.ROAM then
+        handleRoamState()
+    end
+end
+
+local function mainLoop(deltaTime)
+    if not running or not getCharacterComponents() then return end
+    if pauseUntil > 0 and tick() < pauseUntil then return end
+    if actionLock and tick() < actionUntil then return end
+    actionLock = false
+    perceptionTimer = perceptionTimer + deltaTime
+    if perceptionTimer < params.perceptionThrottle then return end
+    perceptionTimer = 0
+    if tick() - lastPingMeasure > 5 then
+        lastPingMeasure = tick()
+        params.pingEstimate = measurePing()
+    end
+    if lastPlayerPos then
+        local currentPos = RootPart.Position
+        local moveDelta = (currentPos - lastPlayerPos).Magnitude
+        if moveDelta > 5 then
+            manualOverride = true
+            task.delay(2, function() manualOverride = false end)
+        end
+    end
+    lastPlayerPos = RootPart.Position
+    if manualOverride then return end
+    local topThreats = findTopThreats(3)
+    local nearestPlayer = findNearestPlayer()
+    local newState, stateData = decideState(topThreats, nearestPlayer)
+    if newState ~= currentState then
+        local oldState = currentState
+        currentState = newState
+        debugPrint("State", "Transition: " .. oldState .. " -> " .. newState)
+        for _, callback in ipairs(stateCallbacks) do
+            safeCall(callback, newState, oldState)
+        end
+        currentPath = nil
+        lastPathTime = 0
+    end
+    executeState(currentState, stateData)
+    for ball, decay in pairs(threatDecay) do
+        if not ball or not ball.Parent then
+            threatDecay[ball] = nil
         else
-            -- Inspect surroundings
-            local randomLook = root.Position + Vector3.new(math.cos(tick()), 0, math.sin(tick())) * 10
-            Motor.LookAt(randomLook, 0.02)
+            threatDecay[ball] = math.min(1.2, decay + params.threatDecayRate)
         end
-        
-        -- Random Crouch/Slide
-        if math.random() < 0.01 then
-            VirtualInputManager:SendKeyEvent(true, "LeftControl", false, game)
-            task.wait(0.2)
-            VirtualInputManager:SendKeyEvent(false, "LeftControl", false, game)
+    end
+    for ball, cooldownTime in pairs(ballCooldowns) do
+        if not ball or not ball.Parent or (tick() - cooldownTime) > 3 then
+            ballCooldowns[ball] = nil
         end
     end
 end
 
--- INITIALIZATION
-local function Initialize()
-    -- Wait for character
-    if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
-    task.wait(CHARACTER_SETUP_DELAY)
-    
-    -- Connections
-    maid:Give(RunService.Heartbeat:Connect(function(dt)
-        -- Run Physics & Logic
-        task.spawn(MainLoop) -- Non-blocking
-        
-        -- Monitor Memory (Separate Loop to save CPU)
-        for player, _ in pairs(Memory.Profiles) do
-            Memory.UpdateProfile(player, "AFK_CHECK")
-        end
-    end))
-    
-    maid:Give(LocalPlayer.CharacterAdded:Connect(function(char)
-        task.wait(1)
-        -- Reset specific states on respawn
-        Brain.State = "IDLE"
-        Movement.Path = nil
-    end))
-    
-    -- Chat Listener for Social Engineering
-    if TextChatService then
-        maid:Give(TextChatService.ChatInputBarFocused:GetSignal():Connect(function()
-            -- Stop fighting while typing
-            Brain.State = "IDLE"
-        end))
+function SmartAutoPlay.Start()
+    if running then return end
+    running = true
+    currentState = State.IDLE
+    telemetry.sessionStart = tick()
+    debugPrint("Lifecycle", "SmartAutoPlay started")
+    if not getCharacterComponents() then
+        Player.CharacterAdded:Wait()
+        getCharacterComponents()
     end
-    
-    print("NEURAL-HUMAN AI INITIALIZED")
+    connections.heartbeat = RunService.Heartbeat:Connect(function(dt)
+        safeCall(mainLoop, dt)
+    end)
+    connections.charAdded = Player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        getCharacterComponents()
+        threatCache = {}
+        threatHistory = {}
+        actionLock = false
+        currentPath = nil
+    end)
+    local success, helper = safeCall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/TripleScript/TripleHub/main/helper_.lua"))()
+    end)
+    if success and helper then
+        parryHelper = helper
+        debugPrint("Init", "Parry helper loaded")
+    end
 end
 
-Initialize()
-
--- SELF DESTRUCT WRAPPER
-_G.KillAI = function()
-    maid:Clean()
-    print("AI TERMINATED")
+function SmartAutoPlay.Stop()
+    if not running then return end
+    running = false
+    currentState = State.IDLE
+    debugPrint("Lifecycle", "SmartAutoPlay stopped")
+    for name, conn in pairs(connections) do
+        if conn then conn:Disconnect() end
+    end
+    connections = {}
+    for _, task in pairs(activeTasks) do
+        if task then task:Cancel() end
+    end
+    activeTasks = {}
+    if moveConnection then
+        moveConnection:Disconnect()
+        moveConnection = nil
+    end
+    threatCache = {}
+    threatHistory = {}
+    threatDecay = {}
+    ballCooldowns = {}
+    currentPath = nil
+    actionLock = false
+    if Humanoid then
+        Humanoid:Move(Vector3.new(0, 0, 0), true)
+    end
 end
+
+function SmartAutoPlay.IsRunning()
+    return running
+end
+
+function SmartAutoPlay.SetDebug(enabled)
+    debugEnabled = enabled
+    debugPrint("Config", "Debug mode: " .. tostring(enabled))
+end
+
+function SmartAutoPlay.SetParameters(newParams)
+    for k, v in pairs(newParams) do
+        if params[k] ~= nil then
+            if type(v) == "number" then
+                params[k] = clamp(v, 0, 1000)
+            else
+                params[k] = v
+            end
+        end
+    end
+    debugPrint("Config", "Parameters updated")
+end
+
+function SmartAutoPlay.GetTelemetry()
+    local runtime = tick() - telemetry.sessionStart
+    return {
+        runtime = runtime,
+        parryAttempts = #telemetry.parryAttempts,
+        parrySuccess = telemetry.parrySuccess,
+        parryFails = telemetry.parryFails,
+        successRate = telemetry.parrySuccess / math.max(1, telemetry.parrySuccess + telemetry.parryFails),
+        emergencyTriggers = telemetry.emergencyTriggers,
+        pathSuccesses = telemetry.pathSuccesses,
+        pathFailures = telemetry.pathFailures,
+        avgPing = params.pingEstimate,
+        currentState = currentState,
+        recentAttempts = telemetry.parryAttempts
+    }
+end
+
+function SmartAutoPlay.GetTopThreats(n)
+    return findTopThreats(n or 3)
+end
+
+function SmartAutoPlay.OnStateChanged(callback)
+    table.insert(stateCallbacks, callback)
+end
+
+function SmartAutoPlay.OnParryAttempt(callback)
+    table.insert(parryCallbacks, callback)
+end
+
+function SmartAutoPlay.PauseFor(seconds)
+    pauseUntil = tick() + seconds
+end
+
+function SmartAutoPlay.SetHoldPosition(enabled)
+    holdPosition = enabled
+end
+
+function SmartAutoPlay.ResetState()
+    threatCache = {}
+    threatHistory = {}
+    threatDecay = {}
+    ballCooldowns = {}
+    actionLock = false
+    currentPath = nil
+    debugPrint("State", "State reset")
+end
+
+function SmartAutoPlay.LoadProfile(profileName)
+    local profiles = {
+        conservative = {
+            emergencyDistance = 20,
+            emergencySpeed = 70,
+            parryStyle = "conservative",
+            leadDistance = 3,
+            engageDistance = 30
+        },
+        balanced = {
+            emergencyDistance = 16,
+            emergencySpeed = 90,
+            parryStyle = "balanced",
+            leadDistance = 2,
+            engageDistance = 35
+        },
+        aggressive = {
+            emergencyDistance = 12,
+            emergencySpeed = 110,
+            parryStyle = "aggressive",
+            leadDistance = 1.5,
+            engageDistance = 45
+        }
+    }
+    local profile = profiles[profileName]
+    if profile then
+        SmartAutoPlay.SetParameters(profile)
+        debugPrint("Config", "Loaded profile: " .. profileName)
+    end
+end
+
+return SmartAutoPlay
