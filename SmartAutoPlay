@@ -523,15 +523,24 @@ end
 
 local function handleRoamState()
     if not RootPart or not Humanoid or not params.enableRoam then return end
+    
+    if math.random() < 0.7 then
+        return 
+    end
+
     local randomAngle = math.random() * math.pi * 2
-    local randomDist = math.random() * params.roamRadius
+    local randomDist = math.random(15, 35)
     local offsetX = math.cos(randomAngle) * randomDist
     local offsetZ = math.sin(randomAngle) * randomDist
     local roamPos = RootPart.Position + Vector3.new(offsetX, 0, offsetZ)
+
     if checkGroundSafety(roamPos) then
+        Humanoid.WalkSpeed = math.random(14, 18) 
+        
         moveToPosition(roamPos)
-        local waitTime = math.random(10, 30) / 10
-        task.wait(waitTime)
+
+        local postMoveWait = math.random(4, 10)
+        task.wait(postMoveWait)
     end
 end
 
