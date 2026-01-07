@@ -1,0 +1,427 @@
+local SmartAutoPlay = {}
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+
+local Player = Players.LocalPlayer
+local Character
+local Humanoid
+local RootPart
+
+local PERCEPTION_THROTTLE = 0.1
+local EMERGENCY_DISTANCE = 16
+local EMERGENCY_SPEED = 90
+local ENGAGE_DISTANCE = 35
+local OBSERVE_DISTANCE = 25
+local PARRY_DISTANCE = 5
+local LEAD_DISTANCE = 2
+local PATH_RECOMPUTE_DELAY = 1.5
+local SIDESTEP_DISTANCE = 5
+local ROAM_RADIUS = 15
+
+local State = {
+    IDLE = "Idle",
+    OBSERVE = "Observe",
+    ENGAGE = "Engage",
+    EMERGENCY = "Emergency"
+}
+
+local currentState = State.IDLE
+local running = false
+local mainConnection
+local perceptionTimer = 0
+local lastPathTime = 0
+local currentPath
+local currentWaypointIndex
+local targetPosition
+local targetFacing
+local debugEnabled = false
+local threatDecay = {}
+
+local function getCharacterComponents()
+    Character = Player.Character
+    if not Character then return false end
+    
+    Humanoid = Character:FindFirstChildOfClass("Humanoid")
+    RootPart = Character:FindFirstChild("HumanoidRootPart")
+    
+    return Humanoid and RootPart and Humanoid.Health > 0
+end
+
+local function isValidBall(ball)
+    if not ball or not ball:IsA("BasePart") then return false end
+    if not ball:GetAttribute("realBall") then return false end
+    return true
+end
+
+local function getBallVelocity(ball)
+    local zoomies = ball:FindFirstChild("zoomies")
+    if zoomies and zoomies:IsA("BodyVelocity") then
+        return zoomies.VectorVelocity
+    end
+    return ball.AssemblyLinearVelocity
+end
+
+local function evaluateBallThreat(ball)
+    if not isValidBall(ball) or not RootPart then return nil end
+    
+    local ballPos = ball.Position
+    local velocity = getBallVelocity(ball)
+    local speed = velocity.Magnitude
+    
+    if speed <= 0 then return nil end
+    
+    local playerPos = RootPart.Position
+    local toPlayer = playerPos - ballPos
+    local distance = toPlayer.Magnitude
+    local directionDot = toPlayer.Unit:Dot(velocity.Unit)
+    
+    if directionDot <= 0.2 then return nil end
+    
+    local timeToHit = math.max(0, (distance - PARRY_DISTANCE) / speed)
+    
+    local decayFactor = threatDecay[ball] or 1
+    local score = timeToHit - (directionDot * 0.25) + (distance / 100)
+    score = score * decayFactor
+    
+    return {
+        ball = ball,
+        position = ballPos,
+        velocity = velocity,
+        speed = speed,
+        distance = distance,
+        directionDot = directionDot,
+        timeToHit = timeToHit,
+        score = score
+    }
+end
+
+local function findMostDangerousBall()
+    local ballsFolder = Workspace:FindFirstChild("Balls")
+    if not ballsFolder then return nil end
+    
+    local mostDangerous = nil
+    local lowestScore = math.huge
+    
+    for _, ball in pairs(ballsFolder:GetChildren()) do
+        local threat = evaluateBallThreat(ball)
+        if threat and threat.score < lowestScore then
+            lowestScore = threat.score
+            mostDangerous = threat
+        end
+    end
+    
+    return mostDangerous
+end
+
+local function findNearestPlayer()
+    if not RootPart then return nil end
+    
+    local nearestPlayer = nil
+    local nearestDistance = math.huge
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    
+    if not aliveFolder then return nil end
+    
+    for _, otherChar in pairs(aliveFolder:GetChildren()) do
+        if otherChar ~= Character and otherChar:FindFirstChild("HumanoidRootPart") then
+            local otherHum = otherChar:FindFirstChildOfClass("Humanoid")
+            if otherHum and otherHum.Health > 0 then
+                local distance = (otherChar.HumanoidRootPart.Position - RootPart.Position).Magnitude
+                if distance < nearestDistance then
+                    nearestDistance = distance
+                    nearestPlayer = {
+                        character = otherChar,
+                        distance = distance,
+                        position = otherChar.HumanoidRootPart.Position
+                    }
+                end
+            end
+        end
+    end
+    
+    return nearestPlayer
+end
+
+local function faceTarget(targetPos)
+    if not RootPart then return end
+    
+    local rootPos = RootPart.Position
+    local lookAt = Vector3.new(targetPos.X, rootPos.Y, targetPos.Z)
+    RootPart.CFrame = CFrame.new(rootPos, lookAt)
+end
+
+local function performSidestep(directionVector)
+    if not RootPart or not Humanoid then return end
+    
+    local sidestepPos = RootPart.Position + (directionVector * SIDESTEP_DISTANCE)
+    Humanoid:MoveTo(sidestepPos)
+end
+
+local function createPath()
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentMaxSlope = 45,
+        Costs = {
+            Water = 20
+        }
+    })
+    return path
+end
+
+local function followPath(destination)
+    if not RootPart or not Humanoid then return false end
+    
+    local success, errorMsg = pcall(function()
+        if not currentPath then
+            currentPath = createPath()
+        end
+        
+        currentPath:ComputeAsync(RootPart.Position, destination)
+        
+        if currentPath.Status == Enum.PathStatus.Success then
+            local waypoints = currentPath:GetWaypoints()
+            currentWaypointIndex = 1
+            
+            for i, waypoint in ipairs(waypoints) do
+                if not running or currentState ~= State.ENGAGE then break end
+                
+                if waypoint.Action == Enum.PathWaypointAction.Jump then
+                    Humanoid.Jump = true
+                end
+                
+                Humanoid:MoveTo(waypoint.Position)
+                
+                local timeout = 0
+                repeat
+                    task.wait(0.1)
+                    timeout = timeout + 0.1
+                until (RootPart.Position - waypoint.Position).Magnitude < 3 or timeout > 2 or not running
+            end
+            return true
+        else
+            Humanoid:MoveTo(destination)
+            return false
+        end
+    end)
+    
+    if not success then
+        if Humanoid then
+            Humanoid:MoveTo(destination)
+        end
+        return false
+    end
+    
+    return success
+end
+
+local function decideState(dangerousBall, nearestPlayer)
+    if dangerousBall then
+        if dangerousBall.distance <= EMERGENCY_DISTANCE and dangerousBall.speed >= EMERGENCY_SPEED then
+            return State.EMERGENCY
+        elseif dangerousBall.timeToHit <= 0.55 and dangerousBall.distance <= ENGAGE_DISTANCE then
+            return State.ENGAGE
+        end
+    end
+    
+    if nearestPlayer and nearestPlayer.distance <= OBSERVE_DISTANCE then
+        return State.OBSERVE
+    end
+    
+    return State.IDLE
+end
+
+local function handleEmergencyState(threat)
+    if not RootPart then return end
+    
+    local perpendicular = Vector3.new(-threat.velocity.Z, 0, threat.velocity.X).Unit
+    
+    performSidestep(perpendicular)
+    
+    if threat.ball then
+        faceTarget(threat.ball.Position)
+    end
+    
+    threatDecay[threat.ball] = 0.5
+end
+
+local function handleEngageState(threat)
+    if not RootPart then return end
+    
+    local currentTime = tick()
+    
+    local interceptPoint = threat.position - (threat.velocity.Unit * LEAD_DISTANCE)
+    local distance = (RootPart.Position - interceptPoint).Magnitude
+    
+    if distance > 3 and (currentTime - lastPathTime) > PATH_RECOMPUTE_DELAY then
+        lastPathTime = currentTime
+        task.spawn(function()
+            followPath(interceptPoint)
+        end)
+    elseif distance <= 3 then
+        Humanoid:MoveTo(RootPart.Position)
+    end
+    
+    if threat.ball then
+        faceTarget(threat.ball.Position)
+    end
+    
+    threatDecay[threat.ball] = 1.2
+end
+
+local function handleObserveState(nearestPlayer)
+    if not RootPart or not nearestPlayer then return end
+    
+    faceTarget(nearestPlayer.position)
+    
+    local idealDistance = OBSERVE_DISTANCE * 0.7
+    if nearestPlayer.distance < idealDistance then
+        local awayVector = (RootPart.Position - nearestPlayer.position).Unit
+        local retreatPos = RootPart.Position + (awayVector * 3)
+        Humanoid:MoveTo(retreatPos)
+    elseif nearestPlayer.distance > OBSERVE_DISTANCE * 0.9 then
+        Humanoid:MoveTo(RootPart.Position)
+    end
+end
+
+local function handleIdleState()
+    if not RootPart or not Humanoid then return end
+    
+    local randomX = math.random(-ROAM_RADIUS, ROAM_RADIUS)
+    local randomZ = math.random(-ROAM_RADIUS, ROAM_RADIUS)
+    local roamPos = RootPart.Position + Vector3.new(randomX, 0, randomZ)
+    
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    
+    local rayOrigin = roamPos + Vector3.new(0, 5, 0)
+    local result = Workspace:Raycast(rayOrigin, Vector3.new(0, -10, 0), rayParams)
+    
+    if result then
+        roamPos = result.Position
+    end
+    
+    Humanoid:MoveTo(roamPos)
+    
+    local timeout = 0
+    repeat
+        task.wait(0.5)
+        timeout = timeout + 0.5
+    until not running or timeout > 3
+end
+
+local function updateDebugDisplay(dangerousBall, nearestPlayer)
+    if not debugEnabled then return end
+    
+    local debugText = string.format(
+        "State: %s | Ball: %s | TTH: %.2f | Player Dist: %.1f",
+        currentState,
+        dangerousBall and "YES" or "NO",
+        dangerousBall and dangerousBall.timeToHit or 0,
+        nearestPlayer and nearestPlayer.distance or 999
+    )
+    
+    print(debugText)
+end
+
+local function mainLoop(deltaTime)
+    if not running or not getCharacterComponents() then return end
+    
+    perceptionTimer = perceptionTimer + deltaTime
+    
+    if perceptionTimer >= PERCEPTION_THROTTLE then
+        perceptionTimer = 0
+        
+        local dangerousBall = findMostDangerousBall()
+        local nearestPlayer = findNearestPlayer()
+        
+        local newState = decideState(dangerousBall, nearestPlayer)
+        
+        if newState ~= currentState then
+            currentState = newState
+            currentPath = nil
+            lastPathTime = 0
+        end
+        
+        if currentState == State.EMERGENCY and dangerousBall then
+            handleEmergencyState(dangerousBall)
+        elseif currentState == State.ENGAGE and dangerousBall then
+            handleEngageState(dangerousBall)
+        elseif currentState == State.OBSERVE and nearestPlayer then
+            handleObserveState(nearestPlayer)
+        elseif currentState == State.IDLE then
+            handleIdleState()
+        end
+        
+        updateDebugDisplay(dangerousBall, nearestPlayer)
+        
+        for ball, decay in pairs(threatDecay) do
+            if not ball or not ball.Parent then
+                threatDecay[ball] = nil
+            else
+                threatDecay[ball] = math.min(1, decay + 0.1)
+            end
+        end
+    end
+end
+
+function SmartAutoPlay.Start()
+    if running then return end
+    
+    running = true
+    currentState = State.IDLE
+    perceptionTimer = 0
+    threatDecay = {}
+    
+    if not getCharacterComponents() then
+        Player.CharacterAdded:Wait()
+        getCharacterComponents()
+    end
+    
+    mainConnection = RunService.Heartbeat:Connect(mainLoop)
+    
+    Player.CharacterAdded:Connect(function(newChar)
+        if running then
+            task.wait(0.5)
+            getCharacterComponents()
+        end
+    end)
+end
+
+function SmartAutoPlay.Stop()
+    running = false
+    currentState = State.IDLE
+    
+    if mainConnection then
+        mainConnection:Disconnect()
+        mainConnection = nil
+    end
+    
+    currentPath = nil
+    currentWaypointIndex = nil
+    threatDecay = {}
+    
+    if Humanoid then
+        Humanoid:Move(Vector3.new(0, 0, 0), true)
+    end
+end
+
+function SmartAutoPlay.SetDebug(enabled)
+    debugEnabled = enabled
+end
+
+function SmartAutoPlay.SetParameters(params)
+    EMERGENCY_DISTANCE = params.emergencyDistance or EMERGENCY_DISTANCE
+    EMERGENCY_SPEED = params.emergencySpeed or EMERGENCY_SPEED
+    ENGAGE_DISTANCE = params.engageDistance or ENGAGE_DISTANCE
+    OBSERVE_DISTANCE = params.observeDistance or OBSERVE_DISTANCE
+    PARRY_DISTANCE = params.parryDistance or PARRY_DISTANCE
+    LEAD_DISTANCE = params.leadDistance or LEAD_DISTANCE
+end
+
+return SmartAutoPlay
